@@ -60,7 +60,7 @@ data Story = Story {
   , iso_language_code :: Text
   , to_user_id_str    :: Maybe Text
   , source            :: Text
-  } deriving (Show, Typeable, Data, Generic)
+  } deriving (Eq, Show, Typeable, Data, Generic)
 
 instance NFData Story
 
@@ -76,6 +76,6 @@ data Result = Result {
   , since_id_str     :: Text
   , max_id_str       :: Text
   , query            :: Text
-  } deriving (Show, Typeable, Data, Generic)
+  } deriving (Eq, Show, Typeable, Data, Generic)
 
 instance NFData Result

@@ -9,7 +9,7 @@ import qualified Typed.Manual as Manual
 import qualified Typed.TH as TH
 
 main :: IO ()
-main = defaultMain [
+main = Manual.validate >> defaultMain [
     Generic.benchmarks
   , Manual.benchmarks
   , TH.benchmarks

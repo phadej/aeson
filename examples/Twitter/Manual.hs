@@ -30,6 +30,7 @@ import Data.Aeson hiding (Result)
 #else
 import "aeson" Data.Aeson hiding (Result)
 import qualified "aeson-benchmarks" Data.Aeson as B
+import qualified "aeson-benchmarks" Data.Aeson.Stream.Parser as B
 #endif
 
 instance ToJSON Metadata where
@@ -169,6 +170,10 @@ instance B.FromJSON Metadata where
   parseJSON (B.Object v) = Metadata <$> v B..: "result_type"
   parseJSON _          = empty
 
+instance B.FromStream Metadata where
+  parseStream = B.withObjectP "Metadata" $ Metadata
+    <$> B.objectField "result_type"
+
 instance B.ToJSON Geo where
   toJSON Geo{..} = B.object [
       "type_"       B..= type_
@@ -184,6 +189,11 @@ instance B.FromJSON Geo where
         v B..: "type_"
     <*> v B..: "coordinates"
   parseJSON _          = empty
+
+instance B.FromStream Geo where
+  parseStream = B.withObjectP "Geo" $ Geo
+    <$> B.objectField "type"
+    <*> B.objectField "coordinates"
 
 instance B.ToJSON Story where
   toJSON Story{..} = B.object [
@@ -237,6 +247,26 @@ instance B.FromJSON Story where
     <*> v B..: "source"
   parseJSON _ = empty
 
+instance B.FromStream Story where
+  parseStream = B.fromParseJSON
+{-
+  -- CHEAT :)
+  parseStream = B.withObjectP "Story" $ Story
+    <$> B.objectField "from_user_id_str"
+    <*> B.objectField "profile_image_url"
+    <*> B.objectField "created_at"
+    <*> B.objectField "from_user"
+    <*> B.objectField "id_str"
+    <*> B.objectField "metadata"
+    <*> B.objectField "to_user_id"
+    <*> B.objectField "text"
+    <*> B.objectField "id"
+    <*> B.objectField "from_user_id"
+    <*> B.objectField "geo"
+    <*> B.objectField "iso_language_code"
+    <*> B.objectField "to_user_id_str"
+    <*> B.objectField "source"
+-}
 instance B.ToJSON Result where
   toJSON Result{..} = B.object [
       "results"          B..= results
@@ -279,4 +309,18 @@ instance B.FromJSON Result where
     <*> v B..: "max_id_str"
     <*> v B..: "query"
   parseJSON _ = empty
+
+instance B.FromStream Result where
+  parseStream = B.withObjectP "Result" $ Result
+    <$> B.objectField "results"
+    <*> B.objectField "max_id"
+    <*> B.objectField "since_id"
+    <*> B.objectField "refresh_url"
+    <*> B.objectField "next_page"
+    <*> B.objectField "results_per_page"
+    <*> B.objectField "page"
+    <*> B.objectField "completed_in"
+    <*> B.objectField "since_id_str"
+    <*> B.objectField "max_id_str"
+    <*> B.objectField "query"
 #endif

@@ -7,29 +7,58 @@ import Prelude.Compat
 
 import Data.Aeson
 import Data.Aeson.Stream
+import Data.Aeson.Stream.Parser
 import System.Environment (getArgs)
 import Data.Vector (Vector)
+import Data.Text (Text)
+import Data.Set (Set)
+import Data.Foldable (traverse_, toList)
 
 import qualified Data.ByteString.Lazy as BL
+
+-- | "Envelope"
+newtype Laureates a = Laureates { getLaureates :: a }
+  deriving Show
 
 newtype Count = Count { getCount :: Int }
   deriving Show
 
-instance FromJSON Count where
-    parseJSON = withObject "Laureates" $ \obj -> do
-        v <- obj .: "laureates"
-        pure $ Count $ length (v :: Vector Value)
+newtype Surname = Surname (Maybe Text)
+  deriving (Eq, Ord, Show)
 
-countParseJSON :: BL.ByteString -> Either String Count
+-------------------------------------------------------------------------------
+-- parseJSON
+-------------------------------------------------------------------------------
+
+countParseJSON :: BL.ByteString -> Either String (Laureates Count)
 countParseJSON = eitherDecode
 
+surnamesParseJSON :: BL.ByteString -> Either String (Laureates (Set Surname))
+surnamesParseJSON = eitherDecode
+
+instance FromJSON a => FromJSON (Laureates a) where
+    parseJSON = withObject "Laureates" $ \obj -> Laureates
+        <$> obj .: "laureates"
+
+instance FromJSON Count where
+    parseJSON = withArray "Count" $ \v ->
+        pure $ Count $ length (v :: Vector Value)
+
+instance FromJSON Surname where
+    parseJSON = withObject "Laureate" $ \obj -> Surname
+        <$> obj .:? "surname"
+
+-------------------------------------------------------------------------------
+-- tokenStream
+-------------------------------------------------------------------------------
+
 -- | A bit manual ATM
-countTokenStream :: BL.ByteString -> Either String Count
+countTokenStream :: BL.ByteString -> Either String (Laureates Count)
 countTokenStream s = case tokenStream s of
     TkObjectOpen : TkKey "laureates" :  TkArrayOpen : rest -> go 0 rest
     _ -> Left "invalid input"
   where
-    go !acc [TkArrayClose, TkObjectClose] = Right (Count acc)
+    go !acc [TkArrayClose, TkObjectClose] = Right (Laureates (Count acc))
     go !acc ts = do
         ts' <- skip ts
         go (acc + 1) ts'
@@ -55,15 +84,53 @@ skip = go (0 :: Int)
     done !n ts | n <= 0    = Right ts
                | otherwise = go n ts
 
+-------------------------------------------------------------------------------
+-- TokenParser
+-------------------------------------------------------------------------------
+
+countTokenParser :: BL.ByteString -> Either String (Laureates Count)
+countTokenParser = decodeStream . tokenStream
+
+surnamesTokenParser :: BL.ByteString -> Either String (Laureates (Set Surname))
+surnamesTokenParser = decodeStream . tokenStream
+
+instance FromStream a => FromStream (Laureates a) where
+    parseStream = withObjectP "Laureates" $ Laureates
+        <$> objectField "laureates"
+
+instance FromStream Count where
+    parseStream = Count <$> arrayLength
+
+instance FromStream Surname where
+    parseStream = withObjectP "Laureate" $ Surname
+        <$> objectFieldMaybe "surname"
+
+arrayLength :: P Int
+arrayLength = foldArray' 0 (\n _ -> n + 1) skipValue
+
+-------------------------------------------------------------------------------
+-- Main
+-------------------------------------------------------------------------------
+
 main :: IO ()
 main = do
     args <- getArgs
     contents <- BL.readFile "json-data/laureate.json"
+    counts contents args
 
-    counter <- case args of
-        ["parseJSON"] -> pure countParseJSON
-        ["tokenStream"] ->  pure countTokenStream
-        _ -> fail "specify variant: parseJSON or tokenStream"
+counts :: BL.ByteString -> [String] -> IO ()
+counts contents args = case args of
+    ["parseJSON"]   -> k countParseJSON
+    ["tokenStream"] -> k countTokenStream
+    ["TokenParser"] -> k countTokenParser
+    _ -> surnames contents args
+  where
+    k counter = either fail (print . getCount . getLaureates) $ counter contents
 
-    c <- either fail (pure . getCount) $ counter contents
-    print c
+surnames :: BL.ByteString -> [String] -> IO ()
+surnames contents args = case args of
+    ["parseJSON-surnames"]   -> k surnamesParseJSON
+    ["TokenParser-surnames"] -> k surnamesTokenParser
+    _ -> fail "specify variant: parseJSON, tokenStream, TokenParser"
+  where
+    k p = either fail (traverse_ print . take 10 . toList . getLaureates) $ p contents

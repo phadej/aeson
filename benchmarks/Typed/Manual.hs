@@ -1,5 +1,5 @@
 {-# LANGUAGE PackageImports #-}
-module Typed.Manual (benchmarks, decodeBenchmarks) where
+module Typed.Manual (benchmarks, decodeBenchmarks, validate) where
 
 import Prelude ()
 import Prelude.Compat
@@ -10,6 +10,8 @@ import Data.ByteString.Lazy as L
 import Twitter.Manual
 import Typed.Common
 import qualified "aeson-benchmarks" Data.Aeson as B
+import qualified "aeson-benchmarks" Data.Aeson.Stream as B
+import qualified "aeson-benchmarks" Data.Aeson.Stream.Parser as B
 
 encodeDirectA :: Result -> L.ByteString
 encodeDirectA = encode
@@ -47,6 +49,9 @@ decodeDirectA = decode
 decodeDirectB :: L.ByteString -> Maybe Result
 decodeDirectB = B.decode
 
+decodeTokenParser :: L.ByteString -> Either String Result
+decodeTokenParser = B.decodeStream . B.tokenStream
+
 decodeBenchmarks :: Benchmark
 decodeBenchmarks =
   env ((,) <$> L.readFile "json-data/twitter100.json" <*> L.readFile "json-data/jp100.json") $ \ ~(twitter100, jp100) ->
@@ -54,7 +59,17 @@ decodeBenchmarks =
     [ bgroup "direct"
       [ bench "twitter100"          $ nf decodeDirectB twitter100
       , bench "jp100"               $ nf decodeDirectB jp100
-      , bench "twitter100 baseline"  $ nf decodeDirectA twitter100
+      , bench "twitter100 baseline" $ nf decodeDirectA twitter100
       , bench "jp100 baseline"      $ nf decodeDirectA jp100
       ]
+    , bgroup "TokenParser"
+      [ bench "twitter100"          $ nf decodeTokenParser twitter100
+      ]
     ]
+
+validate :: IO ()
+validate = do
+  twitter100 <- L.readFile "json-data/twitter100.json"
+  d <- maybe (fail "direct") pure $ decodeDirectB twitter100
+  t <- either fail pure $ decodeTokenParser twitter100
+  print (d == t)
