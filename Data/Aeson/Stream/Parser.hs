@@ -13,12 +13,17 @@ import Data.Int (Int64)
 import qualified Data.ByteString.Lazy as BSL
 import qualified Data.Map as Map
 import qualified Data.Vector as V
+import qualified Data.HashMap.Strict as HM
 
 -- import qualified Generics.SOP as SOP
 
 -- Instances
 import qualified Data.Set as Set
 import qualified Data.Scientific as Scientific
+
+-- Unsafe interface
+import GHC.Exts (Any)
+import Unsafe.Coerce (unsafeCoerce)
 
 -- import Debug.Trace
 
@@ -72,9 +77,28 @@ expectedToken t = P $ \ts e k -> case ts of
 -- Object
 -------------------------------------------------------------------------------
 
--- | Applicative Trie!
+objectField :: FromStream a => Text -> OP a
+objectField k = explicitObjectField k parseStream
+
+objectFieldMaybe :: FromStream a => Text -> OP (Maybe a)
+objectFieldMaybe k = explicitObjectFieldMaybe k parseStream
+
+-------------------------------------------------------------------------------
+-- Applicative Trie
+-------------------------------------------------------------------------------
+
+{--
+
 data OP a where OP :: Maybe a -> Map.Map Text (OPF a) -> OP a
 data OPF a where OPFAp :: P b -> OP (b -> a) -> OPF a
+
+explicitObjectField :: Text -> P a -> OP a
+explicitObjectField k p =
+    OP Nothing (Map.singleton k (OPFAp p (pure id)))
+
+explicitObjectFieldMaybe :: Text -> P a -> OP (Maybe a)
+explicitObjectFieldMaybe k p =
+    OP (Just Nothing) (Map.singleton k (OPFAp p (pure Just)))
 
 instance Functor OPF where
     fmap f (OPFAp p op) = OPFAp p (fmap (f .) op)
@@ -97,20 +121,6 @@ instance Applicative OP where
           where
             h da b d = g (da d) b
         {-# INLINE combine' #-}
-
-explicitObjectField :: Text -> P a -> OP a
-explicitObjectField k p =
-    OP Nothing (Map.singleton k (OPFAp p (pure id)))
-
-explicitObjectFieldMaybe :: Text -> P a -> OP (Maybe a)
-explicitObjectFieldMaybe k p =
-    OP (Just Nothing) (Map.singleton k (OPFAp p (pure Just)))
-
-objectField :: FromStream a => Text -> OP a
-objectField k = explicitObjectField k parseStream
-
-objectFieldMaybe :: FromStream a => Text -> OP (Maybe a)
-objectFieldMaybe k = explicitObjectFieldMaybe k parseStream
 
 withObjectP :: forall a. String -> OP a -> P a
 withObjectP name op = open >> go op
@@ -139,10 +149,181 @@ withObjectP name op = open >> go op
                 -- unknown key
                 Nothing            -> skipValue >> go op
                 Just (OPFAp p op') -> (&) <$> p <*> go op'
+
             TkObjectClose -> case o of
                 Just x   -> pure x
                 Nothing  -> fail $ "Unexpected '}', while parsing incomplete " ++ name ++ "; missing keys " ++ show (Map.keys m)
+
+            -- should never happen
             t -> fail $ "Expected key in " ++ name ++ ", got " ++ show t
+--}--
+
+-------------------------------------------------------------------------------
+-- "Unsafe" Object
+-------------------------------------------------------------------------------
+
+-- | Unsafe object parser.
+--
+-- First step: we can differentiate singleton cases
+-- This done because in cases f <$> x and f <*> x, we won't need to modify
+-- pure function.
+data UOP a where
+    UOP             :: U a -> UOP a
+    USingleton      :: Text -> P a -> UOP a
+    USingletonMaybe :: Text -> P a -> UOP (Maybe a)
+
+-- | Unsafe object parser. The thing
+data U a = U
+    { uF :: !Any                  -- ^ function
+    , uK :: V.Vector Text         -- ^ keys, in order function takes arguments.
+    , uP :: Map.Map Text (P Any)  -- ^ parsers
+    , uD :: Map.Map Text Any      -- ^ default values
+    }
+
+explicitObjectFieldU :: Text -> P a -> UOP a
+explicitObjectFieldU = USingleton
+
+explicitObjectFieldMaybeU :: Text -> P a -> UOP (Maybe a)
+explicitObjectFieldMaybeU = USingletonMaybe
+
+instance Functor UOP where
+    fmap f (UOP u) = UOP (fmap f u)
+    fmap f (USingleton k p) = UOP U
+        { uF = unsafeCoerce f
+        , uK = V.singleton k
+        , uP = Map.singleton k (unsafeCoerce p)
+        , uD = Map.empty
+        }
+    fmap f (USingletonMaybe k p) = UOP U
+        { uF = unsafeCoerce f
+        , uK = V.singleton k
+        , uP = Map.singleton k (unsafeCoerce (fmap Just p))
+        , uD = Map.singleton k (unsafeCoerce (Nothing :: Maybe ()))
+        }
+
+toU :: forall a. UOP a -> U a
+toU (UOP u) = u
+toU (USingleton k p) = U
+    { uF = unsafeCoerce (id :: a -> a)
+    , uK = V.singleton k
+    , uP = Map.singleton k (unsafeCoerce p)
+    , uD = Map.empty
+    }
+toU (USingletonMaybe k p) = U
+    { uF = unsafeCoerce (id :: a -> a)
+    , uK = V.singleton k
+    , uP = Map.singleton k (unsafeCoerce (fmap Just p))
+    , uD = Map.singleton k (unsafeCoerce (Nothing :: Maybe ()))
+    }
+
+instance Applicative UOP where
+    pure = UOP . pure
+    UOP (U f k p d) <*> USingleton kx kp = UOP U
+        { uF = f
+        , uK = V.snoc k kx -- todo check, kx not in k
+        , uP = Map.insert kx (unsafeCoerce kp) p
+        , uD = d
+        }
+    UOP (U f k p d) <*> USingletonMaybe kx kp = UOP U
+        { uF = f
+        , uK = V.snoc k kx -- todo check, kx not in k
+        , uP = Map.insert kx (unsafeCoerce (fmap Just kp)) p
+        , uD = Map.insert kx (unsafeCoerce (Nothing :: Maybe ())) d
+        }
+    u <*> v = UOP (toU u <*> toU v)
+
+instance Functor U where
+    fmap f _ = error "fmap @U: not implemented"
+
+instance Applicative U where
+    pure x = U
+        { uF = unsafeCoerce x
+        , uK = V.empty
+        , uP = Map.empty
+        , uD = Map.empty
+        }
+    _ <*> _ = error "(<*>) @U: not implemented"
+
+withObjectPU :: forall a. String -> UOP a -> P a
+withObjectPU name op = open >> pre op
+  where
+    open :: P ()
+    open = P $ \ts e k -> case ts of
+        (TkObjectOpen : ts') -> k () ts'
+        (t : _) -> e $ "Expected object " ++ name ++ ", got " ++ show t
+        []      -> e $ "Expected object " ++ name ++ ", got end-of-file"
+
+    {- close not needed
+    close :: forall b. b -> P b
+    close x = P $ \ts e k -> case ts of
+        (TkObjectClose : ts') -> k x ts'
+        -- extra keys!
+        (TkKey _ : ts') ->
+            runP skipValue ts'  e $ \() ts'' ->
+            runP (close x) ts'' e k
+        (t : _) -> e $ "Expected '}' " ++ name ++ ", got " ++ show t
+        []      -> e $ "Expected '}' " ++ name ++ ", got end-of-file"
+    -}
+
+    pre :: forall b. UOP b -> P b
+    pre (UOP (U f k p d)) = go f k p d
+    pre _ = error "USIngleton/Maybe not handled"
+
+    go :: forall b. Any -> V.Vector Text -> Map.Map Text (P Any) -> Map.Map Text Any -> P b
+    go f ks ps acc = do
+        t <- token $ "key in " ++ name
+        case t of
+            TkKey k -> case Map.lookup k ps of
+                Nothing -> skipValue >> go f ks ps acc
+                Just p  -> do
+                    x <- unsafeCoerce p :: P ()
+                    go f ks ps (Map.insert k (unsafeCoerce x) acc)
+
+            TkObjectClose
+                | vlen /= Map.size acc ->
+                    fail $ "Unexpected '}', while parsing incomplete " ++ name
+                | otherwise -> case vlen of
+                    0 -> pure (unsafeCoerce acc)
+                    1 -> postAcc1 f (V.unsafeIndex ks 0) acc
+                    2 -> postAcc2 f (V.unsafeIndex ks 1) (V.unsafeIndex ks 2) acc
+                    _ -> foldAcc f (V.toList ks) acc
+              where
+                vlen = V.length ks
+
+            -- should never happen
+            t -> fail $ "Expected key in " ++ name ++ ", got " ++ show t
+
+    foldAcc :: forall b. Any -> [Text] -> Map.Map Text Any -> P b
+    foldAcc x [] _ = pure (unsafeCoerce x)
+    foldAcc f (k : ks) acc
+        | Just v <- Map.lookup k acc = foldAcc (unsafeCoerce f v) ks acc
+        | otherwise = fail $ "U inconsistency: doesn't exist " ++ show k
+
+    postAcc1 :: forall b. Any -> Text -> Map.Map Text Any -> P b
+    postAcc1 f k1 acc
+        | Just v1 <- Map.lookup k1 acc = pure (unsafeCoerce f v1)
+        | otherwise = fail $ "U inconsistency: doesn't exist " ++ show k1
+
+    postAcc2 :: forall b. Any -> Text -> Text -> Map.Map Text Any -> P b
+    postAcc2 f k1 k2 acc
+        | Just v1 <- Map.lookup k1 acc
+        , Just v2 <- Map.lookup k2 acc = pure (unsafeCoerce f v1 v2)
+        | otherwise = fail $ "U inconsistency: doesn't exist " ++ show k1 ++ " or " ++ show k2
+
+--{--
+
+type OP = UOP
+
+explicitObjectField :: Text -> P a -> UOP a
+explicitObjectField = explicitObjectFieldU
+
+explicitObjectFieldMaybe :: Text -> P a -> UOP (Maybe a)
+explicitObjectFieldMaybe = explicitObjectFieldMaybeU
+
+withObjectP :: forall a. String -> OP a -> P a
+withObjectP = withObjectPU
+
+--}--
 
 -------------------------------------------------------------------------------
 -- Helpers

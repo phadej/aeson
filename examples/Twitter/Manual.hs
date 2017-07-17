@@ -171,8 +171,11 @@ instance B.FromJSON Metadata where
   parseJSON _          = empty
 
 instance B.FromStream Metadata where
+--  parseStream = B.fromParseJSON
+--{--
   parseStream = B.withObjectP "Metadata" $ Metadata
     <$> B.objectField "result_type"
+--}--
 
 instance B.ToJSON Geo where
   toJSON Geo{..} = B.object [
@@ -248,9 +251,9 @@ instance B.FromJSON Story where
   parseJSON _ = empty
 
 instance B.FromStream Story where
-  parseStream = B.fromParseJSON
-{-
   -- CHEAT :)
+  --parseStream = B.fromParseJSON
+--{--
   parseStream = B.withObjectP "Story" $ Story
     <$> B.objectField "from_user_id_str"
     <*> B.objectField "profile_image_url"
@@ -266,7 +269,8 @@ instance B.FromStream Story where
     <*> B.objectField "iso_language_code"
     <*> B.objectField "to_user_id_str"
     <*> B.objectField "source"
--}
+--}--
+
 instance B.ToJSON Result where
   toJSON Result{..} = B.object [
       "results"          B..= results
