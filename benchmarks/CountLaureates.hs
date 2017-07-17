@@ -105,7 +105,7 @@ instance FromStream Surname where
     parseStream = withObjectP "Laureate" $ Surname
         <$> objectFieldMaybe "surname"
 
-arrayLength :: P Int
+arrayLength :: P s Int
 arrayLength = foldArray' 0 (\n _ -> n + 1) skipValue
 
 -------------------------------------------------------------------------------

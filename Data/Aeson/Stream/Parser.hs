@@ -21,23 +21,27 @@ import qualified Data.HashMap.Strict as HM
 import qualified Data.Set as Set
 import qualified Data.Scientific as Scientific
 
+--
+import Control.Monad.ST
+import qualified Data.Vector.Mutable as MV
+
 -- Unsafe interface
 import GHC.Exts (Any)
 import Unsafe.Coerce (unsafeCoerce)
 
 -- import Debug.Trace
 
-newtype P a = P
+newtype P s a = P
     { runP :: forall b. TokenStream
-    -> (String -> Either String b)           -- type Failure b =
-    -> (a -> TokenStream -> Either String b) -- type Success a b =
-    -> Either String b
+    -> (String -> ST s (Either String b))           -- type Failure b =
+    -> (a -> TokenStream -> ST s (Either String b)) -- type Success a b =
+    -> ST s (Either String b)
     }
 
-instance Functor P where
+instance Functor (P s) where
     fmap f (P p) = P $ \ts e s -> p ts e (s . f)
 
-instance Applicative P where
+instance Applicative (P s) where
     pure x = P $ \ts _ s -> s x ts
     P pf <*> P px = P $ \ts e k ->
         pf ts  e $ \f ts'  ->
@@ -49,38 +53,41 @@ instance Applicative P where
         q ts' e $ \_ ts'' ->
         k x ts''
 
-instance Monad P where
+instance Monad (P s) where
     return = pure
     P p >>= f = P $ \ts e k -> p ts e $ \a ts' -> runP (f a) ts' e k
     P p >> P q = P $ \ts e k -> p ts e $ \_ ts' -> q ts' e k
 
     fail err = P $ \_ e _ -> e err
 
-token :: String -> P Token
+token :: String -> P s Token
 token name = P $ \ts e k -> case ts of
     []        -> e $ "Unexpected end-of-file, expecting: " ++ name
     (t : ts') -> k t ts'
 
-peekToken :: String -> P Token
+peekToken :: String -> P s Token
 peekToken name = P $ \ts e k -> case ts of
     []      -> e $ "Unexpected end-of-file, expecting: " ++ name
     (t : _) -> k t ts
 
-expectedToken :: Token -> P ()
+expectedToken :: Token -> P s ()
 expectedToken t = P $ \ts e k -> case ts of
     (t' : ts')
         | t == t'   -> k () ts'
         | otherwise -> e $ "Unexpected " ++ show t' ++ ", expecting" ++ show t
     []              -> e $ "Unexpected end-of-file, expecting: " ++ show t
 
+liftST :: ST s a -> P s a
+liftST st = P $ \ts _e k -> st >>= \x -> k x ts
+
 -------------------------------------------------------------------------------
 -- Object
 -------------------------------------------------------------------------------
 
-objectField :: FromStream a => Text -> OP a
+objectField :: FromStream a => Text -> OP s a
 objectField k = explicitObjectField k parseStream
 
-objectFieldMaybe :: FromStream a => Text -> OP (Maybe a)
+objectFieldMaybe :: FromStream a => Text -> OP s (Maybe a)
 objectFieldMaybe k = explicitObjectFieldMaybe k parseStream
 
 -------------------------------------------------------------------------------
@@ -161,6 +168,8 @@ withObjectP name op = open >> go op
 -------------------------------------------------------------------------------
 -- "Unsafe" Object
 -------------------------------------------------------------------------------
+
+{--
 
 -- | Unsafe object parser.
 --
@@ -324,21 +333,166 @@ withObjectP :: forall a. String -> OP a -> P a
 withObjectP = withObjectPU
 
 --}--
+--}--
+
+-------------------------------------------------------------------------------
+-- Unsafe Object parsing in ST monad
+-------------------------------------------------------------------------------
+
+data OP s a where
+    UOP             :: U s a -> OP s a
+    USingleton      :: Text -> P s a -> OP s a
+    USingletonMaybe :: Text -> P s a -> OP s (Maybe a)
+
+-- | Unsafe object parser. The thing
+data U s a = U
+    { uF :: !Any                         -- ^ function
+    , uP :: Map.Map Text (Int, P s Any)  -- ^ parsers, their index.
+    , uM :: V.Vector Bool                -- ^ mask, which arguments we have
+    , uD :: V.Vector Any                 -- ^ default arguments, "init" of the loop.
+    }
+
+explicitObjectField :: Text -> P s a -> OP s a
+explicitObjectField = USingleton
+
+explicitObjectFieldMaybe :: Text -> P s a -> OP s (Maybe a)
+explicitObjectFieldMaybe = USingletonMaybe
+
+instance Functor (OP s) where
+    fmap f (UOP u) = UOP (fmap f u)
+    fmap f (USingleton k p) = UOP U
+        { uF = unsafeCoerce f
+        , uP = Map.singleton k (0, unsafeCoerce p)
+        , uM = V.singleton False
+        , uD = V.singleton anyUnit
+        }
+    fmap f (USingletonMaybe k p) = UOP U
+        { uF = unsafeCoerce f
+        , uP = Map.singleton k (0, unsafeCoerce (fmap Just p))
+        , uM = V.singleton True
+        , uD = V.singleton anyNothing
+        }
+
+toU :: forall a s. OP s a -> U s a
+toU (UOP u) = u
+toU (USingleton k p) = U
+    { uF = unsafeCoerce (id :: a -> a)
+    , uP = Map.singleton k (0, unsafeCoerce p)
+    , uM = V.singleton False
+    , uD = V.singleton anyUnit
+    }
+toU (USingletonMaybe k p) = U
+    { uF = unsafeCoerce (id :: a -> a)
+    , uP = Map.singleton k (0, unsafeCoerce (fmap Just p))
+    , uM = V.singleton True
+    , uD = V.singleton anyNothing
+    }
+
+instance Applicative (OP s) where
+    pure = UOP . pure
+    UOP (U f p m d) <*> USingleton kx kp = UOP U
+        { uF = f
+        , uP = Map.insert kx (V.length m, unsafeCoerce kp) p
+        , uM = V.snoc m False
+        , uD = V.snoc d anyUnit
+        }
+    UOP (U f p m d) <*> USingletonMaybe kx kp = UOP U
+        { uF = f
+        , uP = Map.insert kx (V.length m, unsafeCoerce (fmap Just kp)) p
+        , uM = V.snoc m True
+        , uD = V.snoc d anyNothing
+        }
+
+    u <*> v = UOP (toU u <*> toU v)
+
+instance Functor (U s) where
+    fmap f _ = error "fmap @U: not implemented"
+
+instance Applicative (U s) where
+    pure x = U
+        { uF = unsafeCoerce x
+        , uP = Map.empty
+        , uM = V.empty
+        , uD = V.empty
+        }
+    _ <*> _ = error "(<*>) @U: not implemented"
+
+anyUnit :: Any
+anyUnit = unsafeCoerce ()
+
+anyNothing :: Any
+anyNothing = unsafeCoerce (Nothing :: Maybe ())
+
+withObjectP :: forall a s. String -> OP s a -> P s a
+withObjectP name op = open >> pre op
+  where
+    open :: P s ()
+    open = P $ \ts e k -> case ts of
+        (TkObjectOpen : ts') -> k () ts'
+        (t : _) -> e $ "Expected object " ++ name ++ ", got " ++ show t
+        []      -> e $ "Expected object " ++ name ++ ", got end-of-file"
+
+    {- close not needed
+    close :: forall b. b -> P b
+    close x = P $ \ts e k -> case ts of
+        (TkObjectClose : ts') -> k x ts'
+        -- extra keys!
+        (TkKey _ : ts') ->
+            runP skipValue ts'  e $ \() ts'' ->
+            runP (close x) ts'' e k
+        (t : _) -> e $ "Expected '}' " ++ name ++ ", got " ++ show t
+        []      -> e $ "Expected '}' " ++ name ++ ", got end-of-file"
+    -}
+
+    pre :: forall b. OP s b -> P s b
+    pre (UOP (U f p m d)) = do
+        mask <- liftST (V.thaw m)
+        acc  <- liftST (V.thaw d)
+        go f p mask acc
+    pre _ = error "USIngleton/Maybe not handled"
+
+    go :: forall b. Any -> Map.Map Text (Int, P s Any) -> V.MVector s Bool -> V.MVector s Any -> P s b
+    go f ps mask acc = do
+        t <- token $ "key in " ++ name
+        case t of
+            TkKey k -> case Map.lookup k ps of
+                Nothing -> skipValue >> go f ps mask acc
+                Just (idx, p)  -> do
+                    x <- unsafeCoerce p :: P s ()
+                    liftST $ do 
+                        MV.unsafeWrite mask idx True
+                        MV.unsafeWrite acc idx (unsafeCoerce x)
+                    go f ps mask acc
+
+            TkObjectClose -> do
+                mask' <- liftST $ V.freeze mask
+                case and mask' of
+                    False -> fail $ "Unexpected '}', while parsing incomplete " ++ name
+                    True -> do
+                        acc' <- liftST $ V.freeze acc
+                        foldAcc f (V.toList acc')
+
+            -- should never happen
+            t -> fail $ "Expected key in " ++ name ++ ", got " ++ show t
+
+    foldAcc :: forall b. Any -> [Any] -> P s b
+    foldAcc x []       = pure (unsafeCoerce x)
+    foldAcc f (v : vs) = foldAcc (unsafeCoerce f v) vs
 
 -------------------------------------------------------------------------------
 -- Helpers
 -------------------------------------------------------------------------------
 
-foldArray' :: forall a b. b -> (b -> a -> b) -> P a -> P b
+foldArray' :: forall a b s. b -> (b -> a -> b) -> P s a -> P s b
 foldArray' z f p = open >>= go
   where
-    open :: P b
+    open :: P s b
     open = P $ \ts e k -> case ts of
         (TkArrayOpen : ts') -> k z ts'
         (t : _) -> e $ "Expected array, got " ++ show t
         []      -> e "Expected array, got end-of-file"
 
-    go :: b -> P b
+    go :: b -> P s b
     go b = P $ \ts e k -> case ts of
         (TkArrayClose : ts') -> k b ts'
         ts'@(_ : _) ->
@@ -346,7 +500,7 @@ foldArray' z f p = open >>= go
             let b' = f b a in b' `seq` runP (go b') ts'' e k
         [] -> e "Expected array item or ']', got end-of-file"
 
-skipValue :: P ()
+skipValue :: P s ()
 skipValue = P impl
   where
     impl ts e k = go (0 :: Int) ts
@@ -368,7 +522,7 @@ skipValue = P impl
         done !n ts | n <= 0    = k () ts
                    | otherwise = go n ts
 
-valueP :: P Value
+valueP :: P s Value
 valueP = do
     t <- token "Start of JSON value"
     case t of
@@ -381,7 +535,7 @@ valueP = do
         TkFalse      -> pure (Bool False)
         _ -> fail $ "Expecting JSON value, got token " ++ show t
   where
-    record :: P [Pair]
+    record :: P s [Pair]
     record = do
         t <- token "record key"
         case t of
@@ -392,7 +546,7 @@ valueP = do
             _ -> fail $ "Expecting record key or '}', got token " ++ show t
 
     -- use foldArray'?
-    array :: P [Value]
+    array :: P s [Value]
     array = do
         t <- peekToken "JSON value or ']'"
         case t of
@@ -407,10 +561,10 @@ valueP = do
 -------------------------------------------------------------------------------
 
 class FromStream a where
-    parseStream :: P a
+    parseStream :: P s a
 
 -- | rename to parseStreamViaValue?
-fromParseJSON :: FromJSON a => P a
+fromParseJSON :: FromJSON a => P s a
 fromParseJSON = withValueE f
   where
     f v = case fromJSON v of
@@ -418,23 +572,23 @@ fromParseJSON = withValueE f
         Error err -> Left err
 
 decodeStream :: FromStream a => TokenStream -> Either String a
-decodeStream stream = runP parseStream stream Left success
+decodeStream stream = runST (runP parseStream stream (pure . Left) success)
   where
-    success x [] = Right x
-    success _ ts = Left $ "Unconsumed input: " ++ show (take 10 ts)
+    success x [] = pure (Right x)
+    success _ ts = pure (Left $ "Unconsumed input: " ++ show (take 10 ts))
 
 -------------------------------------------------------------------------------
 -- with-
 -------------------------------------------------------------------------------
 
-withValueE :: (Value -> Either String a) -> P a
+withValueE :: (Value -> Either String a) -> P s a
 withValueE f = do
     v <- valueP
     case f v of
         Right x  -> pure x
         Left err -> fail err
 
-withScientificE :: (Scientific -> Either String a) -> P a
+withScientificE :: (Scientific -> Either String a) -> P s a
 withScientificE f = P $ \ts e k -> case ts of
     (TkNumber x : ts') -> case f x of
         Right y  -> k y ts'
@@ -475,7 +629,7 @@ instance FromStream Double where
     parseStream = withScientificE $
         Right . Scientific.toRealFloat
 
-parseBoundedIntegral:: (Bounded a, Integral a) => P a
+parseBoundedIntegral:: (Bounded a, Integral a) => P s a
 parseBoundedIntegral = withScientificE $ \s -> maybe
     (Left $ "??? is either floating or will cause over or underflow: " ++ show s)
     Right
