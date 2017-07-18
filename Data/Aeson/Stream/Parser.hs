@@ -11,7 +11,7 @@ import Data.Aeson.Stream
 
 import Data.Int (Int64)
 import qualified Data.ByteString.Lazy as BSL
-import qualified Data.Map as Map
+import qualified Data.Map.Strict as Map
 import qualified Data.Vector as V
 import qualified Data.HashMap.Strict as HM
 
@@ -339,6 +339,7 @@ withObjectP = withObjectPU
 -- Unsafe Object parsing in ST monad
 -------------------------------------------------------------------------------
 
+{-
 data OP s a where
     UOP             :: U s a -> OP s a
     USingleton      :: Text -> P s a -> OP s a
@@ -417,11 +418,6 @@ instance Applicative (U s) where
         }
     _ <*> _ = error "(<*>) @U: not implemented"
 
-anyUnit :: Any
-anyUnit = unsafeCoerce ()
-
-anyNothing :: Any
-anyNothing = unsafeCoerce (Nothing :: Maybe ())
 
 withObjectP :: forall a s. String -> OP s a -> P s a
 withObjectP name op = open >> pre op
@@ -459,7 +455,7 @@ withObjectP name op = open >> pre op
                 Nothing -> skipValue >> go f ps mask acc
                 Just (idx, p)  -> do
                     x <- unsafeCoerce p :: P s ()
-                    liftST $ do 
+                    liftST $ do
                         MV.unsafeWrite mask idx True
                         MV.unsafeWrite acc idx (unsafeCoerce x)
                     go f ps mask acc
@@ -478,6 +474,132 @@ withObjectP name op = open >> pre op
     foldAcc :: forall b. Any -> [Any] -> P s b
     foldAcc x []       = pure (unsafeCoerce x)
     foldAcc f (v : vs) = foldAcc (unsafeCoerce f v) vs
+--}--
+
+-------------------------------------------------------------------------------
+-- Simpler Unsafe ST variant
+-------------------------------------------------------------------------------
+
+data OP s a = OP
+    { uF :: Int -> V.MVector s Any -> ST s a   -- ^ function
+    , uP :: !(Map.Map Text (SP s))             -- ^ parsers, their index.
+    , uM :: !(V.Vector Bool)                   -- ^ mask, which arguments we have
+    , uD :: !(V.Vector Any)                    -- ^ default arguments, "init" of the loop.
+    }
+
+data SP s = SP !Int !(P s Any)
+
+explicitObjectField :: Text -> P s a -> OP s a
+explicitObjectField k p = OP
+    { uF = opF
+    , uP = Map.singleton k (SP 0 (unsafeCoerce p))
+    , uM = V.singleton False
+    , uD = V.singleton anyUnit
+    }
+
+opF :: Int -> V.MVector s Any -> ST s a
+opF i mv = fmap unsafeCoerce (MV.unsafeRead mv i)
+
+explicitObjectFieldMaybe :: Text -> P s a -> OP s (Maybe a)
+explicitObjectFieldMaybe k p = OP
+    { uF = opF
+    , uP = Map.singleton k (SP 0 (unsafeCoerce (fmap Just p)))
+    , uM = V.singleton True
+    , uD = V.singleton anyNothing
+    }
+
+instance Functor (OP s) where
+    fmap g (OP f p m d) = OP f' p m d
+      where
+        f' i mv = fmap g (f i mv)
+
+instance Applicative (OP f) where
+    pure x = OP
+        { uF = f
+        , uP = mempty
+        , uM = mempty
+        , uD = mempty
+        }
+      where
+        f _ _ = pure x
+
+    OP ff fp fm fd <*> OP xf xp xm xd = OP
+        { uF = f
+        , uP = Map.union fp xp'
+        , uM = (V.++) fm xm
+        , uD = (V.++) fd xd
+        }
+      where
+        n = V.length fm
+        xp' = fmap (first (+ n)) xp
+
+        f i mv = ff i mv <*> xf (i + n) mv
+
+first :: (Int -> Int) -> SP s -> SP s
+first f (SP i x) = SP (f i) x
+
+withObjectP :: forall a s. String -> OP s a -> P s a
+withObjectP name op = open >> pre op
+  where
+    open :: P s ()
+    open = P $ \ts e k -> case ts of
+        (TkObjectOpen : ts') -> k () ts'
+        (t : _) -> e $ "Expected object " ++ name ++ ", got " ++ show t
+        []      -> e $ "Expected object " ++ name ++ ", got end-of-file"
+
+    {- close not needed
+    close :: forall b. b -> P b
+    close x = P $ \ts e k -> case ts of
+        (TkObjectClose : ts') -> k x ts'
+        -- extra keys!
+        (TkKey _ : ts') ->
+            runP skipValue ts'  e $ \() ts'' ->
+            runP (close x) ts'' e k
+        (t : _) -> e $ "Expected '}' " ++ name ++ ", got " ++ show t
+        []      -> e $ "Expected '}' " ++ name ++ ", got end-of-file"
+    -}
+
+    pre :: forall b. OP s b -> P s b
+    pre (OP f p m d) = do
+        mask <- liftST (V.thaw m)
+        acc  <- liftST (V.thaw d)
+        go f p mask acc
+
+    go :: forall b. (Int -> V.MVector s Any -> ST s b)
+       -> Map.Map Text (SP s)
+       -> V.MVector s Bool
+       -> V.MVector s Any
+       -> P s b
+    go f ps mask acc = do
+        t <- token $ "key in " ++ name
+        case t of
+            TkKey k -> case Map.lookup k ps of
+                Nothing -> skipValue >> go f ps mask acc
+                Just (SP idx p) -> do
+                    x <- unsafeCoerce p :: P s ()
+                    liftST $ do
+                        MV.unsafeWrite mask idx True
+                        MV.unsafeWrite acc idx (unsafeCoerce x)
+                    go f ps mask acc
+
+            TkObjectClose -> do
+                mask' <- liftST $ V.freeze mask
+                case and mask' of
+                    False -> fail $ "Unexpected '}', while parsing incomplete " ++ name
+                    True -> liftST (f 0 acc)
+
+            -- should never happen
+            t -> fail $ "Expected key in " ++ name ++ ", got " ++ show t
+
+-------------------------------------------------------------------------------
+-- Any's
+-------------------------------------------------------------------------------
+
+anyUnit :: Any
+anyUnit = unsafeCoerce ()
+
+anyNothing :: Any
+anyNothing = unsafeCoerce (Nothing :: Maybe ())
 
 -------------------------------------------------------------------------------
 -- Helpers
