@@ -6,6 +6,7 @@
 -- Work around a compiler bug
 {-# OPTIONS_GHC -fsimpl-tick-factor=300 #-}
 #endif
+{-# OPTIONS_GHC -fplugin=LiquidHaskell #-}
 -- |
 -- Module:      Data.Aeson.Parser.Internal
 -- Copyright:   (c) 2011-2016 Bryan O'Sullivan

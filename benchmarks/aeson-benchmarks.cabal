@@ -10,7 +10,7 @@ library
   build-depends:
       attoparsec
     , data-fix
-    , base
+    -- , base
     , base-compat-batteries
     , bytestring             >=0.10.4
     , containers
@@ -50,6 +50,9 @@ library
     build-depends:
         nats
       , void
+
+  build-depends: liquidhaskell ==0.8.10.2
+  build-depends: liquid-base
 
   include-dirs:     ../include
   ghc-options:      -O2 -Wall

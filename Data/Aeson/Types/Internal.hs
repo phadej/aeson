@@ -14,6 +14,10 @@
 {-# LANGUAGE TemplateHaskell #-}
 #endif
 
+#ifndef MIN_VERSION_base
+#define MIN_VERSION_base(x,y,z) 1
+#endif
+
 -- |
 -- Module:      Data.Aeson.Types.Internal
 -- Copyright:   (c) 2011-2016 Bryan O'Sullivan
